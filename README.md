@@ -1,6 +1,6 @@
 <h1 align="center">
 <br>
-<img src="tempest_logo.jpg" width="360">
+<img src="tempest_logo.jpg">
 <br>
 Tempest
 </h1>
