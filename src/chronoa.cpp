@@ -97,7 +97,7 @@ static bool parse_int64_arg(const char *s, int64_t &out) {
 }
 
 static bool is_weak_enctype(uint16_t etype) {
-    return etype == 1 || etype == 3 || etype == 16 || etype == 23;
+    return etype == 1 || etype == 2 || etype == 3 || etype == 16 || etype == 23;
 }
 
 static bool resolve_default_ccache_path(std::string &out_path, std::string &err) {
@@ -387,7 +387,13 @@ static void evaluate_once(
 
     if (!load_and_parse_ccache(
             ccache_path, rep.version, rep.default_principal, rep.creds, rep.exit_code, rep.error)) {
-        rep.status = (rep.exit_code == TEMPEST_EXIT_MISSING) ? "MISSING" : "PARSE_ERROR";
+        if (rep.exit_code == TEMPEST_EXIT_MISSING) {
+            rep.status = "MISSING";
+        } else if (rep.exit_code == TEMPEST_EXIT_POLICY_STOP) {
+            rep.status = "POLICY_STOP";
+        } else {
+            rep.status = "PARSE_ERROR";
+        }
         return;
     }
 

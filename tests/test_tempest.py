@@ -134,10 +134,43 @@ def test_souei_probe_kcm_and_inotify():
             assert bad_res.returncode == 2, f"Expected exit 2 for 0666 KCM socket, got {bad_res.returncode}"
             bad_data = json.loads(bad_res.stdout)
             assert len(bad_data["policy_violations"]) >= 1
+
+            # Verify insecure group-accessible socket policy violation (0660 -> exit 2)
+            os.chmod(sock_path, 0o660)
+            grp_res = run_cmd([SOUEI, "--kcm-socket", sock_path, "--json"])
+            assert grp_res.returncode == 2, f"Expected exit 2 for 0660 KCM socket, got {grp_res.returncode}"
+            grp_data = json.loads(grp_res.stdout)
+            assert len(grp_data["policy_violations"]) >= 1
         finally:
             stop_evt.set()
             srv.close()
             t.join(timeout=2)
+
+        # Verify stale/unlistening 0600 socket (ECONNREFUSED -> non-zero exit 3, not silent 0 OK)
+        stale_sock = os.path.join(td, "stale.sock")
+        stale_srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale_srv.bind(stale_sock)
+        os.chmod(stale_sock, 0o600)
+        stale_srv.close()
+        refused_res = run_cmd([SOUEI, "--kcm-socket", stale_sock, "--json"])
+        assert refused_res.returncode == 3, f"Expected exit 3 for ECONNREFUSED socket, got {refused_res.returncode}: {refused_res.stdout}"
+        refused_data = json.loads(refused_res.stdout)
+        assert refused_data["kcm_socket"]["exists"] is True
+        assert refused_data["kcm_socket"]["is_socket"] is True
+        assert refused_data["kcm_socket"]["connected"] is False
+        assert refused_data["kcm_socket"]["error"] != ""
+
+        # Verify non-socket existing path -> exit 2 POLICY_STOP
+        non_sock = os.path.join(td, "not_a_socket.txt")
+        with open(non_sock, "wb") as f:
+            f.write(b"regular-file")
+        os.chmod(non_sock, 0o600)
+        ns_res = run_cmd([SOUEI, "--kcm-socket", non_sock, "--json"])
+        assert ns_res.returncode == 2, f"Expected exit 2 for non-socket path, got {ns_res.returncode}: {ns_res.stdout}"
+        ns_data = json.loads(ns_res.stdout)
+        assert ns_data["kcm_socket"]["exists"] is True
+        assert ns_data["kcm_socket"]["is_socket"] is False
+        assert len(ns_data["policy_violations"]) >= 1
 
         miss_res = run_cmd([SOUEI, "--kcm-socket", os.path.join(td, "missing.sock"), "--json"])
         assert miss_res.returncode == 3, f"Expected exit 3 for missing socket, got {miss_res.returncode}"
@@ -247,6 +280,21 @@ def test_chronoa_ccache_and_skew():
         d_rc4 = json.loads(r_rc4.stdout)
         assert d_rc4["status"] == "WEAK_ENCTYPE" and d_rc4["weak_enctype"] is True
 
+        # Weak enctype (des-cbc-md4 = 2) -> exit 2
+        cc_des_md4 = os.path.join(td, "cc_des_md4")
+        with open(cc_des_md4, "wb") as f:
+            f.write(
+                build_ccache_v4(
+                    ["ely"], "TANUKI.LOCAL", ["krbtgt", "TANUKI.LOCAL"],
+                    2, now - 60, now - 60, now + 3600, now + 86400
+                )
+            )
+        r_des_md4 = run_cmd([CHRONOA, "--ccache", cc_des_md4, "--now", str(now), "--json"])
+        assert r_des_md4.returncode == 2, f"des-cbc-md4 expected 2, got {r_des_md4.returncode}: {r_des_md4.stdout}"
+        d_des_md4 = json.loads(r_des_md4.stdout)
+        assert d_des_md4["status"] == "WEAK_ENCTYPE" and d_des_md4["weak_enctype"] is True
+        assert d_des_md4["primary_ticket"]["enctype_name"] == "des-cbc-md4", d_des_md4
+
         # Missing CCACHE -> exit 3
         r_miss = run_cmd([CHRONOA, "--ccache", os.path.join(td, "missing_cc"), "--json"])
         assert r_miss.returncode == 3 and json.loads(r_miss.stdout)["status"] == "MISSING"
@@ -257,6 +305,18 @@ def test_chronoa_ccache_and_skew():
             f.write(b"\xde\xad\xbe\xef" * 4)
         r_bad = run_cmd([CHRONOA, "--ccache", cc_bad, "--json"])
         assert r_bad.returncode == 4 and json.loads(r_bad.stdout)["status"] == "PARSE_ERROR"
+
+        # Permission-denied CCACHE -> exit 2 POLICY_STOP (when unprivileged)
+        if hasattr(os, "geteuid") and os.geteuid() != 0:
+            cc_perm = os.path.join(td, "cc_noperm")
+            with open(cc_perm, "wb") as f:
+                f.write(b"locked")
+            os.chmod(cc_perm, 0o000)
+            try:
+                r_perm = run_cmd([CHRONOA, "--ccache", cc_perm, "--json"])
+                assert r_perm.returncode == 2 and json.loads(r_perm.stdout)["status"] == "POLICY_STOP", r_perm.stdout
+            finally:
+                os.chmod(cc_perm, 0o600)
 
     print("[PASS] chronoa healthy, RFC 4120 300s skew, --renew-cmd, expired, RC4, missing, corrupt")
 

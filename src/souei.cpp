@@ -37,6 +37,7 @@ struct KcmPeerInfo {
     bool connected = false;
     uint32_t mode = 0;
     bool insecure_mode = false;
+    int connect_errno = 0;
     pid_t pid = -1;
     uid_t uid = (uid_t)-1;
     gid_t gid = (gid_t)-1;
@@ -133,7 +134,7 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
     info.exists = true;
     info.mode = (uint32_t)(st.st_mode & 0777U);
     info.is_socket = S_ISSOCK(st.st_mode);
-    info.insecure_mode = (info.mode & 0007U) != 0; // world rwx
+    info.insecure_mode = (info.mode & 0077U) != 0; // group or world rwx
 
     if (!info.is_socket) {
         info.error = "Path exists but is not a UNIX domain socket";
@@ -142,7 +143,8 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
-        info.error = strerror(errno);
+        info.connect_errno = errno;
+        info.error = strerror(info.connect_errno);
         return info;
     }
 
@@ -157,7 +159,8 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
     memcpy(addr.sun_path, sock_path.c_str(), sock_path.size() + 1);
 
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        info.error = strerror(errno);
+        info.connect_errno = errno;
+        info.error = strerror(info.connect_errno);
         close(fd);
         return info;
     }
@@ -339,10 +342,25 @@ int main(int argc, char **argv) {
         kcm_info = inspect_kcm_socket(kcm_socket);
         if (!kcm_info.exists) {
             exit_code = TEMPEST_EXIT_MISSING;
-        } else if (kcm_info.insecure_mode) {
-            violations.push_back("KCM socket permissions allow world access");
-        } else if (kcm_info.connected && kcm_info.uid != uid && kcm_info.uid != 0) {
-            violations.push_back("KCM socket peer UID mismatch against expected daemon UID");
+        } else if (!kcm_info.is_socket) {
+            violations.push_back("KCM path exists but is not a UNIX domain socket");
+        } else {
+            if (kcm_info.insecure_mode) {
+                if ((kcm_info.mode & 0007U) != 0) {
+                    violations.push_back("KCM socket permissions allow world access");
+                } else {
+                    violations.push_back("KCM socket permissions allow group access");
+                }
+            }
+            if (!kcm_info.connected) {
+                if (kcm_info.connect_errno == EACCES || kcm_info.connect_errno == EPERM) {
+                    violations.push_back("KCM socket connection denied: " + kcm_info.error);
+                } else {
+                    exit_code = TEMPEST_EXIT_MISSING;
+                }
+            } else if (kcm_info.uid != uid && kcm_info.uid != 0) {
+                violations.push_back("KCM socket peer UID mismatch against expected daemon UID");
+            }
         }
     }
 
@@ -356,13 +374,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (exit_code == TEMPEST_EXIT_OK && !violations.empty()) {
+    if (!violations.empty()) {
         exit_code = TEMPEST_EXIT_POLICY_STOP;
     }
 
     const char *status_str =
         (exit_code == TEMPEST_EXIT_OK) ? "OK" :
-        (exit_code == TEMPEST_EXIT_POLICY_STOP) ? "POLICY_STOP" : "RESOURCE_MISSING";
+        (exit_code == TEMPEST_EXIT_POLICY_STOP) ? "POLICY_STOP" :
+        (exit_code == TEMPEST_EXIT_PARSE_ERR) ? "PARSE_ERROR" : "RESOURCE_MISSING";
 
     if (json_out) {
         printf("{\n");

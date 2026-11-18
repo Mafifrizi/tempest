@@ -80,6 +80,7 @@ static inline void tempest_fprint_json_str(FILE *out, const char *s) {
 static inline const char *tempest_enctype_name(int32_t etype) {
     switch (etype) {
         case 1:  return "des-cbc-crc";
+        case 2:  return "des-cbc-md4";
         case 3:  return "des-cbc-md5";
         case 16: return "des3-cbc-sha1";
         case 17: return "aes128-cts-hmac-sha1-96";
