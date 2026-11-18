@@ -18,6 +18,4 @@ This project targets real Linux runtime problems around post-auth identity hygie
 Each operative runs independently and stays out of your way until an identity boundary is put at risk. <br>
 Integration into the main Tanuki toolchain is intentionally decoupled so both codebases stay clean.
 
-### Credit
-- Built by [Mafifrizi](https://github.com/Mafifrizi) for the [Tanuki](https://github.com/Mafifrizi/tanuki) ecosystem
-- README layout inspired by [Cracked5pider/Ekko](https://github.com/Cracked5pider/Ekko)
+
