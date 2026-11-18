@@ -185,6 +185,9 @@ def test_chronoa_ccache_and_skew():
         assert d_ok["skew_sec"] == 12
         assert d_ok["primary_ticket"]["enctype"] == 18
 
+        r_pref = run_cmd([CHRONOA, "--ccache", "FILE:" + cc_ok, "--now", str(now), "--json"])
+        assert r_pref.returncode == 0 and json.loads(r_pref.stdout)["status"] == "HEALTHY", r_pref.stdout
+
         # RFC 4120 boundary: 300s is allowed, 301s triggers policy stop (exit 2)
         r_300 = run_cmd([CHRONOA, "--ccache", cc_ok, "--now", str(now), "--kdc-time", str(now + 300), "--json"])
         assert r_300.returncode == 0

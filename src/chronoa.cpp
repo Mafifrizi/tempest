@@ -630,6 +630,10 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (ccache_path.rfind("FILE:", 0) == 0 && ccache_path.size() > 5) {
+        ccache_path = ccache_path.substr(5);
+    }
+
     if (ccache_path.empty()) {
         std::string resolve_err;
         if (!resolve_default_ccache_path(ccache_path, resolve_err)) {
