@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Community Discussions and Runtime Questions
+    url: https://github.com/Mafifrizi/tempest/discussions
+    about: Ask questions about Linux keyrings, CCACHE hygiene, or integrating Souei, Chronoa, and Ranga.
+  - name: Security Vulnerability Reporting
+    url: https://github.com/Mafifrizi/tempest/security/advisories/new
+    about: Privately disclose keyring isolation, symlink, or credential-handling vulnerabilities.

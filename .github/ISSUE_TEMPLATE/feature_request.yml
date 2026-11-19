@@ -1,0 +1,35 @@
+name: Feature Proposal
+description: Propose a new runtime check, isolation guard, or operative capability for Tempest
+title: "feat: [short summary of feature]"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Proposals for post-auth Linux identity hygiene, keyring isolation, and CCACHE lifecycle guards are welcome.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What real Linux runtime identity boundary or drift issue does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the operative behavior, syscalls/checks, and JSON output fields.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: Architectural Alignment
+      options:
+        - label: Operates unprivileged in Linux userspace using standard C11/C++20 and direct Linux syscalls with zero external libraries.
+          required: true
+        - label: Preserves the five-state semantic exit contract (0..4) and fail-closed safety guards.
+          required: true
