@@ -14,10 +14,23 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install Build Dependencies
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Build & Static Analysis Dependencies
         run: |
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential python3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential
+          python -m pip install --upgrade pip
+          python -m pip install ruff mypy
+
+      - name: Run Static Lint & Type Checks
+        run: |
+          ruff check tests
+          ruff check --select E,F tests
+          mypy --strict tests
 
       - name: Build & Run Tempest Test Suite
         run: make clean && make test

@@ -10,7 +10,6 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -88,11 +87,16 @@ static void print_usage(void) {
 
 static bool parse_int64_arg(const char *s, int64_t &out) {
     if (!s || *s == '\0') return false;
+    if (std::isspace(static_cast<unsigned char>(*s))) return false;
     errno = 0;
     char *end = nullptr;
     long long v = strtoll(s, &end, 10);
     if (errno != 0 || end == s || *end != '\0') return false;
-    out = (int64_t)v;
+    if (v < std::numeric_limits<int64_t>::min() ||
+        v > std::numeric_limits<int64_t>::max()) {
+        return false;
+    }
+    out = static_cast<int64_t>(v);
     return true;
 }
 
@@ -179,13 +183,16 @@ static bool load_and_parse_ccache(
     default_principal_out.clear();
     version_out = 0;
 
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in.is_open()) {
+    int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) {
         int saved = errno;
         if (saved == ENOENT) {
             exit_code_out = TEMPEST_EXIT_MISSING;
             err_out = "CCACHE file not found: " + path;
-        } else if (saved == EACCES) {
+        } else if (saved == ELOOP) {
+            exit_code_out = TEMPEST_EXIT_POLICY_STOP;
+            err_out = "Refusing symbolic link CCACHE path: " + path;
+        } else if (saved == EACCES || saved == EPERM) {
             exit_code_out = TEMPEST_EXIT_POLICY_STOP;
             err_out = "Permission denied reading CCACHE file: " + path;
         } else {
@@ -195,19 +202,50 @@ static bool load_and_parse_ccache(
         return false;
     }
 
-    std::streamsize sz = in.tellg();
-    if (sz < 2 || sz > 16 * 1024 * 1024) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        exit_code_out = TEMPEST_EXIT_PARSE_ERR;
+        err_out = std::string("Failed to stat CCACHE file: ") + strerror(saved);
+        return false;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        exit_code_out = TEMPEST_EXIT_POLICY_STOP;
+        err_out = "Refusing non-regular CCACHE file: " + path;
+        return false;
+    }
+    constexpr off_t kMaxCcacheSize = 16 * 1024 * 1024;
+    if (st.st_size < 2 || st.st_size > kMaxCcacheSize) {
+        close(fd);
         exit_code_out = TEMPEST_EXIT_PARSE_ERR;
         err_out = "Invalid CCACHE file size";
         return false;
     }
-    in.seekg(0, std::ios::beg);
-    std::vector<uint8_t> buf((size_t)sz);
-    if (!in.read(reinterpret_cast<char *>(buf.data()), sz)) {
-        exit_code_out = TEMPEST_EXIT_PARSE_ERR;
-        err_out = "Failed to read CCACHE bytes";
-        return false;
+
+    const size_t expected = static_cast<size_t>(st.st_size);
+    std::vector<uint8_t> buf(expected);
+    size_t total = 0;
+    while (total < expected) {
+        ssize_t n = read(fd, buf.data() + total, expected - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            int saved = errno;
+            close(fd);
+            exit_code_out = TEMPEST_EXIT_PARSE_ERR;
+            err_out = std::string("Failed to read CCACHE bytes: ") + strerror(saved);
+            return false;
+        }
+        if (n == 0) {
+            close(fd);
+            exit_code_out = TEMPEST_EXIT_PARSE_ERR;
+            err_out = "Truncated CCACHE read before expected size";
+            return false;
+        }
+        total += static_cast<size_t>(n);
     }
+    close(fd);
 
     size_t cur = 0;
     uint16_t fmt = 0;
@@ -732,15 +770,17 @@ int main(int argc, char **argv) {
             ccache_path = argv[++i];
             has_ccache_arg = true;
         } else if (arg == "--now") {
-            if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], now_override)) {
-                fprintf(stderr, "chronoa: --now requires an integer epoch\n");
+            if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], now_override) ||
+                now_override < 0) {
+                fprintf(stderr, "chronoa: --now requires a non-negative integer epoch\n");
                 return TEMPEST_EXIT_USAGE;
             }
             has_now_override = true;
             ++i;
         } else if (arg == "--kdc-time") {
-            if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], kdc_time)) {
-                fprintf(stderr, "chronoa: --kdc-time requires an integer epoch\n");
+            if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], kdc_time) ||
+                kdc_time < 0) {
+                fprintf(stderr, "chronoa: --kdc-time requires a non-negative integer epoch\n");
                 return TEMPEST_EXIT_USAGE;
             }
             has_kdc_time = true;

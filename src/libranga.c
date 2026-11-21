@@ -1,8 +1,10 @@
 #include "tempest_contract.h"
 
 #include <errno.h>
+#include <sys/types.h>
 
 static int32_t g_isolated_keyring = -1;
+static pid_t g_owner_pid = -1;
 
 __attribute__((constructor))
 static void tempest_ranga_ctor(void) {
@@ -16,6 +18,7 @@ static void tempest_ranga_ctor(void) {
     long kid = tempest_keyctl(KEYCTL_JOIN_SESSION_KEYRING, 0UL, 0UL, 0UL, 0UL);
     if (kid > 0) {
         g_isolated_keyring = (int32_t)kid;
+        g_owner_pid = getpid();
         long perm_rc = tempest_keyctl(
             KEYCTL_SETPERM,
             (unsigned long)kid,
@@ -40,13 +43,14 @@ static void tempest_ranga_ctor(void) {
 __attribute__((destructor))
 static void tempest_ranga_dtor(void) {
     int saved_errno = errno;
-    if (g_isolated_keyring > 0) {
+    if (g_isolated_keyring > 0 && getpid() == g_owner_pid) {
         tempest_keyctl(KEYCTL_CLEAR, (unsigned long)g_isolated_keyring, 0UL, 0UL, 0UL);
         const char *rev = getenv("RANGA_REVOKE_ON_EXIT");
         if (rev && strcmp(rev, "1") == 0) {
             tempest_keyctl(KEYCTL_REVOKE, (unsigned long)g_isolated_keyring, 0UL, 0UL, 0UL);
         }
         g_isolated_keyring = -1;
+        g_owner_pid = -1;
     }
     errno = saved_errno;
 }
