@@ -33,11 +33,14 @@ struct InotifyRecord {
 struct KcmPeerInfo {
     bool checked = false;
     bool exists = false;
+    bool is_symlink = false;
     bool is_socket = false;
     bool connected = false;
+    bool peercred_ok = false;
     uint32_t mode = 0;
     bool insecure_mode = false;
     int connect_errno = 0;
+    int peercred_errno = 0;
     pid_t pid = -1;
     uid_t uid = (uid_t)-1;
     gid_t gid = (gid_t)-1;
@@ -127,19 +130,25 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
     info.checked = true;
 
     struct stat st;
-    if (stat(sock_path.c_str(), &st) != 0) {
+    if (lstat(sock_path.c_str(), &st) != 0) {
         info.error = strerror(errno);
         return info;
     }
     info.exists = true;
     info.mode = (uint32_t)(st.st_mode & 0777U);
+    if (S_ISLNK(st.st_mode)) {
+        info.is_symlink = true;
+        info.is_socket = false;
+        info.error = "KCM socket path is a symbolic link (refusing symlink redirection)";
+        return info;
+    }
     info.is_socket = S_ISSOCK(st.st_mode);
-    info.insecure_mode = (info.mode & 0077U) != 0; // group or world rwx
 
     if (!info.is_socket) {
         info.error = "Path exists but is not a UNIX domain socket";
         return info;
     }
+    info.insecure_mode = (info.mode & 0077U) != 0; // group or world rwx
 
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -169,7 +178,9 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
     struct ucred cred;
     socklen_t len = sizeof(cred);
     memset(&cred, 0, sizeof(cred));
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+    int gs_rc = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len);
+    if (gs_rc == 0 && len == sizeof(cred) && cred.uid != (uid_t)-1) {
+        info.peercred_ok = true;
         info.pid = cred.pid;
         info.uid = cred.uid;
         info.gid = cred.gid;
@@ -184,7 +195,9 @@ static KcmPeerInfo inspect_kcm_socket(const std::string &sock_path) {
             }
         }
     } else {
-        info.error = strerror(errno);
+        int saved = (gs_rc != 0 && errno != 0) ? errno : EINVAL;
+        info.peercred_errno = saved;
+        info.error = std::string("getsockopt(SO_PEERCRED) failed: ") + strerror(saved);
     }
 
     close(fd);
@@ -211,8 +224,12 @@ static bool watch_file_inotify(
     std::string &err_out
 ) {
     struct stat st;
-    if (stat(path.c_str(), &st) != 0) {
+    if (lstat(path.c_str(), &st) != 0) {
         err_out = strerror(errno);
+        return false;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        err_out = "Refusing to watch symbolic link";
         return false;
     }
 
@@ -224,7 +241,7 @@ static bool watch_file_inotify(
 
     int wd = inotify_add_watch(
         ifd, path.c_str(),
-        IN_OPEN | IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF
+        IN_OPEN | IN_ACCESS | IN_MODIFY | IN_ATTRIB | IN_DELETE_SELF | IN_DONT_FOLLOW
     );
     if (wd < 0) {
         err_out = strerror(errno);
@@ -342,6 +359,8 @@ int main(int argc, char **argv) {
         kcm_info = inspect_kcm_socket(kcm_socket);
         if (!kcm_info.exists) {
             exit_code = TEMPEST_EXIT_MISSING;
+        } else if (kcm_info.is_symlink) {
+            violations.push_back("KCM path is a symbolic link (refusing symlink redirection)");
         } else if (!kcm_info.is_socket) {
             violations.push_back("KCM path exists but is not a UNIX domain socket");
         } else {
@@ -358,6 +377,12 @@ int main(int argc, char **argv) {
                 } else {
                     exit_code = TEMPEST_EXIT_MISSING;
                 }
+            } else if (!kcm_info.peercred_ok) {
+                violations.push_back(
+                    kcm_info.error.empty()
+                        ? "KCM socket SO_PEERCRED failed"
+                        : "KCM socket " + kcm_info.error
+                );
             } else if (kcm_info.uid != uid && kcm_info.uid != 0) {
                 violations.push_back("KCM socket peer UID mismatch against expected daemon UID");
             }

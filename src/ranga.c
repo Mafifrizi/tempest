@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 
@@ -206,21 +207,65 @@ static int write_all(int fd, const uint8_t *buf, size_t len) {
     return 0;
 }
 
-static void fill_random_bytes(uint8_t *buf, size_t len) {
-    int ufd = open("/dev/urandom", O_RDONLY);
+static int fill_random_bytes(uint8_t *buf, size_t len) {
     size_t off = 0;
-    if (ufd >= 0) {
+    bool use_urandom = false;
+
+    while (off < len) {
+        ssize_t n = getrandom(buf + off, len - off, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ENOSYS || errno == EPERM) {
+                use_urandom = true;
+                break;
+            }
+            int saved = errno ? errno : EIO;
+            explicit_bzero(buf, len);
+            errno = saved;
+            return -1;
+        }
+        if (n == 0) {
+            use_urandom = true;
+            break;
+        }
+        off += (size_t)n;
+    }
+
+    if (use_urandom && off < len) {
+        int ufd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (ufd < 0) {
+            int saved = errno ? errno : EIO;
+            explicit_bzero(buf, len);
+            errno = saved;
+            return -1;
+        }
         while (off < len) {
             ssize_t n = read(ufd, buf + off, len - off);
-            if (n <= 0) break;
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                int saved = errno ? errno : EIO;
+                close(ufd);
+                explicit_bzero(buf, len);
+                errno = saved;
+                return -1;
+            }
+            if (n == 0) {
+                close(ufd);
+                explicit_bzero(buf, len);
+                errno = EIO;
+                return -1;
+            }
             off += (size_t)n;
         }
         close(ufd);
     }
-    while (off < len) {
-        buf[off] = (uint8_t)((off * 131U + 0xA5U) & 0xffU);
-        ++off;
+
+    if (off != len) {
+        explicit_bzero(buf, len);
+        errno = EIO;
+        return -1;
     }
+    return 0;
 }
 
 static int overwrite_pass(int fd, off_t size, int mode) {
@@ -234,7 +279,12 @@ static int overwrite_pass(int fd, off_t size, int mode) {
         } else if (mode == 1) {
             memset(buf, 0xff, chunk);
         } else {
-            fill_random_bytes(buf, chunk);
+            if (fill_random_bytes(buf, chunk) < 0) {
+                int saved = errno ? errno : EIO;
+                explicit_bzero(buf, sizeof(buf));
+                errno = saved;
+                return -1;
+            }
         }
         if (write_all(fd, buf, chunk) < 0) {
             explicit_bzero(buf, sizeof(buf));
@@ -268,15 +318,17 @@ static int run_purge(const char *path, bool revoke_session, bool json_mode) {
         exit_code = TEMPEST_EXIT_POLICY_STOP;
         snprintf(err_msg, sizeof(err_msg), "Refusing to purge non-regular file: %s", path);
     } else {
-        int fd = open(path, O_RDWR | O_NOFOLLOW);
+        int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
         if (fd < 0) {
             exit_code = (errno == ENOENT) ? TEMPEST_EXIT_MISSING : TEMPEST_EXIT_POLICY_STOP;
             snprintf(err_msg, sizeof(err_msg), "Failed to open target file: %s", strerror(errno));
         } else {
             struct stat fst;
-            if (fstat(fd, &fst) < 0 || !S_ISREG(fst.st_mode)) {
+            if (fstat(fd, &fst) < 0 || !S_ISREG(fst.st_mode) ||
+                fst.st_dev != lst.st_dev || fst.st_ino != lst.st_ino) {
                 exit_code = TEMPEST_EXIT_POLICY_STOP;
-                snprintf(err_msg, sizeof(err_msg), "File type changed before overwrite");
+                snprintf(err_msg, sizeof(err_msg),
+                         "File type or identity changed before overwrite");
             } else {
                 wiped_bytes = fst.st_size;
                 for (int p = 0; p < 3; ++p) {
@@ -297,7 +349,13 @@ static int run_purge(const char *path, bool revoke_session, bool json_mode) {
             close(fd);
 
             if (exit_code == TEMPEST_EXIT_OK) {
-                if (unlink(path) < 0) {
+                struct stat ulst;
+                if (lstat(path, &ulst) < 0 || !S_ISREG(ulst.st_mode) ||
+                    ulst.st_dev != fst.st_dev || ulst.st_ino != fst.st_ino) {
+                    exit_code = TEMPEST_EXIT_POLICY_STOP;
+                    snprintf(err_msg, sizeof(err_msg),
+                             "Target file identity changed before unlink");
+                } else if (unlink(path) < 0) {
                     exit_code = TEMPEST_EXIT_POLICY_STOP;
                     snprintf(err_msg, sizeof(err_msg), "unlink failed: %s", strerror(errno));
                 } else {
@@ -315,11 +373,26 @@ static int run_purge(const char *path, bool revoke_session, bool json_mode) {
             0UL,
             0UL
         );
-        if (kid > 0) {
+        if (kid <= 0) {
+            int saved = errno ? errno : ENOKEY;
+            if (exit_code == TEMPEST_EXIT_OK) {
+                exit_code = TEMPEST_EXIT_POLICY_STOP;
+                snprintf(err_msg, sizeof(err_msg),
+                         "Session keyring lookup for revocation failed: %s",
+                         strerror(saved));
+            }
+        } else {
             long c_rc = tempest_keyctl(KEYCTL_CLEAR, (unsigned long)kid, 0UL, 0UL, 0UL);
+            (void)c_rc;
             long r_rc = tempest_keyctl(KEYCTL_REVOKE, (unsigned long)kid, 0UL, 0UL, 0UL);
-            if (c_rc == 0 || r_rc == 0) {
+            int r_err = (r_rc < 0) ? (errno ? errno : EPERM) : 0;
+            if (r_rc == 0) {
                 session_revoked = true;
+            } else if (exit_code == TEMPEST_EXIT_OK) {
+                exit_code = TEMPEST_EXIT_POLICY_STOP;
+                snprintf(err_msg, sizeof(err_msg),
+                         "KEYCTL_REVOKE failed: %s",
+                         strerror(r_err));
             }
         }
     }

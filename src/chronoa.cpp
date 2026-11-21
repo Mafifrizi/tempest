@@ -75,7 +75,7 @@ static void print_usage(void) {
         "    --now <EPOCH>             Override current UNIX epoch seconds (deterministic check)\n"
         "    --kdc-time <EPOCH>        Reference KDC UNIX epoch seconds for RFC 4120 300s skew check\n"
         "    --warn-window-sec <SEC>   Pre-expiry warning/renewal threshold in seconds (default: 300)\n"
-        "    --renew-cmd <CMD>         Command executed via /bin/sh -c when ticket is expiring/expired\n"
+        "    --renew-cmd <CMD>         Command parsed into argv and executed via execvp (no shell) when expiring/expired\n"
         "    --once                    Evaluate once and exit (default)\n"
         "    --watch                   Poll continuously every --interval-sec seconds until SIGINT/SIGTERM\n"
         "    --interval-sec <SEC>      Watch polling interval in seconds (default: 30)\n"
@@ -109,7 +109,11 @@ static bool resolve_default_ccache_path(std::string &out_path, std::string &err)
     std::string raw(env);
     if (raw.rfind("FILE:", 0) == 0) {
         out_path = raw.substr(5);
-        return !out_path.empty();
+        if (out_path.empty()) {
+            err = "Empty FILE: path in KRB5CCNAME";
+            return false;
+        }
+        return true;
     }
     if (raw.find(':') != std::string::npos && raw[0] != '/') {
         err = "Unsupported non-FILE KRB5CCNAME scheme: " + raw;
@@ -346,17 +350,142 @@ static int select_primary_cred(const std::vector<CcacheCred> &creds) {
     return fallback;
 }
 
-// Run --renew-cmd in a detached child with stdout -> /dev/null so --json stays valid.
-static int run_renew_command(const std::string &cmd) {
+static bool is_disallowed_shell_operator(char c) {
+    return c == ';' || c == '&' || c == '|' || c == '`' ||
+           c == '<' || c == '>' || c == '\n' || c == '\r' ||
+           c == '(' || c == ')';
+}
+
+static bool parse_renew_argv(
+    const std::string &cmd,
+    std::vector<std::string> &argv_out,
+    std::string &err_out
+) {
+    argv_out.clear();
+    err_out.clear();
+
+    std::string current;
+    bool in_token = false;
+    bool in_single = false;
+    bool in_double = false;
+
+    for (size_t i = 0; i < cmd.size(); ++i) {
+        char c = cmd[i];
+        if (c == '\n' || c == '\r') {
+            err_out = "Newline characters are not permitted in --renew-cmd";
+            return false;
+        }
+
+        if (in_single) {
+            if (c == '\'') {
+                in_single = false;
+            } else {
+                current.push_back(c);
+            }
+            continue;
+        }
+
+        if (in_double) {
+            if (c == '"') {
+                in_double = false;
+            } else if (c == '\\') {
+                if (i + 1 >= cmd.size()) {
+                    err_out = "Trailing backslash inside double quotes in --renew-cmd";
+                    return false;
+                }
+                char nxt = cmd[i + 1];
+                if (nxt == '\n' || nxt == '\r') {
+                    err_out = "Newline characters are not permitted in --renew-cmd";
+                    return false;
+                }
+                if (nxt == '"' || nxt == '\\' || nxt == '$' || nxt == '`') {
+                    current.push_back(nxt);
+                    ++i;
+                } else {
+                    current.push_back(c);
+                }
+            } else if (c == '`' || (c == '$' && i + 1 < cmd.size() && (cmd[i + 1] == '(' || cmd[i + 1] == '{'))) {
+                err_out = "Shell expansion syntax is not permitted in --renew-cmd";
+                return false;
+            } else {
+                current.push_back(c);
+            }
+            continue;
+        }
+
+        if (is_disallowed_shell_operator(c)) {
+            err_out = "Shell metacharacters/operators are not permitted in --renew-cmd";
+            return false;
+        }
+        if (c == '$' && i + 1 < cmd.size() && (cmd[i + 1] == '(' || cmd[i + 1] == '{')) {
+            err_out = "Shell expansion syntax (${ / $() is not permitted in --renew-cmd";
+            return false;
+        }
+
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (in_token) {
+                argv_out.push_back(std::move(current));
+                current.clear();
+                in_token = false;
+            }
+        } else if (c == '\'') {
+            in_single = true;
+            in_token = true;
+        } else if (c == '"') {
+            in_double = true;
+            in_token = true;
+        } else if (c == '\\') {
+            if (i + 1 >= cmd.size()) {
+                err_out = "Trailing backslash in --renew-cmd";
+                return false;
+            }
+            char nxt = cmd[++i];
+            if (nxt == '\n' || nxt == '\r') {
+                err_out = "Newline characters are not permitted in --renew-cmd";
+                return false;
+            }
+            current.push_back(nxt);
+            in_token = true;
+        } else {
+            current.push_back(c);
+            in_token = true;
+        }
+    }
+
+    if (in_single || in_double) {
+        err_out = "Unterminated quote in --renew-cmd";
+        return false;
+    }
+    if (in_token) {
+        argv_out.push_back(std::move(current));
+    }
+    if (argv_out.empty()) {
+        err_out = "--renew-cmd must not be empty";
+        return false;
+    }
+    return true;
+}
+
+// Run --renew-cmd directly via execvp (no shell) with stdout -> /dev/null so --json stays valid.
+static int run_renew_command(const std::vector<std::string> &argv) {
+    if (argv.empty()) return -1;
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull >= 0) {
-            dup2(devnull, STDOUT_FILENO);
-            close(devnull);
+            if (devnull != STDOUT_FILENO) {
+                dup2(devnull, STDOUT_FILENO);
+                close(devnull);
+            }
         }
-        execl("/bin/sh", "sh", "-c", cmd.c_str(), (char *)nullptr);
+        std::vector<char *> c_argv;
+        c_argv.reserve(argv.size() + 1);
+        for (const auto &s : argv) {
+            c_argv.push_back(const_cast<char *>(s.c_str()));
+        }
+        c_argv.push_back(nullptr);
+        execvp(c_argv[0], c_argv.data());
         _exit(127);
     }
     int status = 0;
@@ -375,7 +504,7 @@ static void evaluate_once(
     bool has_kdc_time,
     int64_t kdc_time_epoch,
     int64_t warn_window_sec,
-    const std::string &renew_cmd,
+    const std::vector<std::string> &renew_argv,
     CcacheReport &rep
 ) {
     rep = CcacheReport{};
@@ -429,10 +558,10 @@ static void evaluate_once(
 
     assess_state();
 
-    if (!renew_cmd.empty() && !rep.skew_violation && !rep.weak_enctype &&
+    if (!renew_argv.empty() && !rep.skew_violation && !rep.weak_enctype &&
         (rep.expired || rep.expiring_soon)) {
         rep.renew_attempted = true;
-        rep.renew_exit_code = run_renew_command(renew_cmd);
+        rep.renew_exit_code = run_renew_command(renew_argv);
 
         uint16_t post_ver = 0;
         std::string post_princ, post_err;
@@ -568,12 +697,15 @@ static void print_text_report(const CcacheReport &rep) {
 
 int main(int argc, char **argv) {
     std::string ccache_path;
+    bool has_ccache_arg = false;
     bool has_now_override = false;
     int64_t now_override = 0;
     bool has_kdc_time = false;
     int64_t kdc_time = 0;
     int64_t warn_window_sec = 300;
     std::string renew_cmd;
+    std::vector<std::string> renew_argv;
+    bool has_renew_cmd = false;
     bool watch_mode = false;
     int64_t interval_sec = 30;
     bool json_mode = false;
@@ -598,6 +730,7 @@ int main(int argc, char **argv) {
                 return TEMPEST_EXIT_USAGE;
             }
             ccache_path = argv[++i];
+            has_ccache_arg = true;
         } else if (arg == "--now") {
             if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], now_override)) {
                 fprintf(stderr, "chronoa: --now requires an integer epoch\n");
@@ -620,10 +753,11 @@ int main(int argc, char **argv) {
             ++i;
         } else if (arg == "--renew-cmd") {
             if (i + 1 >= argc) {
-                fprintf(stderr, "chronoa: --renew-cmd requires a shell command\n");
+                fprintf(stderr, "chronoa: --renew-cmd requires a command\n");
                 return TEMPEST_EXIT_USAGE;
             }
             renew_cmd = argv[++i];
+            has_renew_cmd = true;
         } else if (arg == "--interval-sec") {
             if (i + 1 >= argc || !parse_int64_arg(argv[i + 1], interval_sec) || interval_sec <= 0) {
                 fprintf(stderr, "chronoa: --interval-sec requires a positive integer\n");
@@ -636,8 +770,38 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (ccache_path.rfind("FILE:", 0) == 0 && ccache_path.size() > 5) {
-        ccache_path = ccache_path.substr(5);
+    if (has_renew_cmd) {
+        std::string renew_err;
+        if (!parse_renew_argv(renew_cmd, renew_argv, renew_err)) {
+            fprintf(stderr, "chronoa: invalid --renew-cmd: %s\n", renew_err.c_str());
+            return TEMPEST_EXIT_USAGE;
+        }
+    }
+
+    if (has_ccache_arg) {
+        if (ccache_path.rfind("FILE:", 0) == 0) {
+            ccache_path = ccache_path.substr(5);
+        }
+        if (ccache_path.empty()) {
+            fprintf(stderr, "chronoa: --ccache requires a non-empty file path\n");
+            return TEMPEST_EXIT_USAGE;
+        }
+        size_t colon = ccache_path.find(':');
+        size_t slash = ccache_path.find('/');
+        if (colon != std::string::npos && ccache_path[0] != '/' &&
+            (slash == std::string::npos || colon < slash)) {
+            std::string scheme_err = "Unsupported non-FILE CCACHE scheme: " + ccache_path;
+            if (json_mode) {
+                CcacheReport err_rep;
+                err_rep.exit_code = TEMPEST_EXIT_MISSING;
+                err_rep.status = "MISSING";
+                err_rep.error = scheme_err;
+                print_json_report(err_rep);
+            } else {
+                fprintf(stderr, "chronoa: %s\n", scheme_err.c_str());
+            }
+            return TEMPEST_EXIT_MISSING;
+        }
     }
 
     if (ccache_path.empty()) {
@@ -670,7 +834,7 @@ int main(int argc, char **argv) {
             has_kdc_time,
             kdc_time,
             warn_window_sec,
-            renew_cmd,
+            renew_argv,
             rep
         );
         if (json_mode) {
@@ -679,7 +843,15 @@ int main(int argc, char **argv) {
             print_text_report(rep);
         }
         if (!watch_mode || g_stop) break;
-        sleep((unsigned int)interval_sec);
+        int64_t clamped_sleep = interval_sec;
+        if (clamped_sleep < 1) {
+            clamped_sleep = 1;
+        }
+        int64_t max_sleep = (int64_t)std::numeric_limits<unsigned int>::max();
+        if (clamped_sleep > max_sleep) {
+            clamped_sleep = max_sleep;
+        }
+        sleep((unsigned int)clamped_sleep);
     } while (!g_stop);
 
     return rep.exit_code;

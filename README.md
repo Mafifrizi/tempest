@@ -16,6 +16,7 @@ Designed as a companion layer for [Tanuki](https://github.com/Mafifrizi/tanuki).
 ### NOTE
 This project targets real Linux runtime problems around post-auth identity hygiene and lifecycle drift. <br>
 Each operative runs independently and stays out of your way until an identity boundary is put at risk. <br>
-Integration into the main Tanuki toolchain is intentionally decoupled so both codebases stay clean.
+Integration into the main Tanuki toolchain is intentionally decoupled so both codebases stay clean. <br>
+Full architecture, kernel primitives, and CLI contracts live in [Architecture](docs/ARCHITECTURE.md) and [CLI Reference](docs/CLI.md).
 
 

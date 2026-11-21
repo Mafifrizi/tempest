@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os
+import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -18,7 +20,7 @@ RANGA = str(BIN / "ranga")
 LIBRANGA = str(BIN / "libranga.so")
 
 
-def run_cmd(cmd, env=None, timeout=10):
+def run_cmd(cmd, env=None, timeout=10, cwd=None):
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
@@ -29,7 +31,27 @@ def run_cmd(cmd, env=None, timeout=10):
         text=True,
         env=merged_env,
         timeout=timeout,
+        cwd=cwd,
     )
+
+
+def compile_interposer(td, name, c_source):
+    gcc = shutil.which("gcc")
+    if not gcc:
+        return None
+    src_path = os.path.join(td, f"{name}.c")
+    so_path = os.path.join(td, f"{name}.so")
+    with open(src_path, "w", encoding="utf-8") as f:
+        f.write(c_source)
+    res = subprocess.run(
+        [gcc, "-shared", "-fPIC", "-O2", "-o", so_path, src_path, "-ldl"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=15,
+    )
+    assert res.returncode == 0, f"Failed to compile test interposer {name}: {res.stderr}"
+    return so_path
 
 
 def pack_principal(components, realm, name_type=1):
@@ -141,6 +163,54 @@ def test_souei_probe_kcm_and_inotify():
             assert grp_res.returncode == 2, f"Expected exit 2 for 0660 KCM socket, got {grp_res.returncode}"
             grp_data = json.loads(grp_res.stdout)
             assert len(grp_data["policy_violations"]) >= 1
+
+            # Verify symlink KCM socket is rejected via lstat before connect (exit 2)
+            os.chmod(sock_path, 0o600)
+            sym_sock = os.path.join(td, "kcm_sym.sock")
+            os.symlink(sock_path, sym_sock)
+            sym_res = run_cmd([SOUEI, "--kcm-socket", sym_sock, "--json"])
+            assert sym_res.returncode == 2, f"Expected exit 2 for symlink KCM socket, got {sym_res.returncode}"
+            sym_data = json.loads(sym_res.stdout)
+            assert sym_data["kcm_socket"]["exists"] is True
+            assert sym_data["kcm_socket"]["is_socket"] is False
+            assert sym_data["kcm_socket"]["connected"] is False
+            assert len(sym_data["policy_violations"]) >= 1
+            assert "symbolic link" in " ".join(sym_data["policy_violations"]).lower(), sym_data
+
+            # Verify getsockopt(SO_PEERCRED) failure is reported distinctly from UID mismatch
+            peercred_so = compile_interposer(
+                td,
+                "fail_peercred",
+                """
+                #define _GNU_SOURCE
+                #include <dlfcn.h>
+                #include <errno.h>
+                #include <stddef.h>
+                #include <sys/socket.h>
+                int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
+                    static int (*real_getsockopt)(int, int, int, void *, socklen_t *) = NULL;
+                    if (!real_getsockopt) {
+                        real_getsockopt = dlsym(RTLD_NEXT, "getsockopt");
+                    }
+                    if (level == SOL_SOCKET && optname == SO_PEERCRED) {
+                        errno = EPERM;
+                        return -1;
+                    }
+                    return real_getsockopt(sockfd, level, optname, optval, optlen);
+                }
+                """,
+            )
+            if peercred_so:
+                pc_res = run_cmd(
+                    [SOUEI, "--kcm-socket", sock_path, "--json"],
+                    env={"LD_PRELOAD": peercred_so},
+                )
+                assert pc_res.returncode == 2, f"Expected exit 2 on SO_PEERCRED failure, got {pc_res.returncode}"
+                pc_data = json.loads(pc_res.stdout)
+                assert pc_data["kcm_socket"]["connected"] is True
+                joined_v = " ".join(pc_data["policy_violations"])
+                assert "mismatch" not in joined_v.lower(), pc_data
+                assert "SO_PEERCRED" in (joined_v + " " + pc_data["kcm_socket"]["error"]), pc_data
         finally:
             stop_evt.set()
             srv.close()
@@ -253,6 +323,82 @@ def test_chronoa_ccache_and_skew():
         d_ren = json.loads(r_ren.stdout)
         assert d_ren["renew_attempted"] is True and d_ren["renew_exit_code"] == 0
         assert d_ren["renewed"] is True and d_ren["status"] == "RENEWED" and d_ren["ttl_sec"] == 3600
+
+        # Non-shell --renew-cmd preserves AD '$' principals and rejects shell injection
+        with open(cc_renew, "wb") as f:
+            f.write(
+                build_ccache_v4(
+                    ["ely"], "TANUKI.LOCAL", ["krbtgt", "TANUKI.LOCAL"],
+                    18, now - 3500, now - 3500, now + 120, now + 86400
+                )
+            )
+        ad_arg_py = os.path.join(td, "check_ad_arg.py")
+        with open(ad_arg_py, "w", encoding="utf-8") as f:
+            f.write(
+                "import pathlib, sys\n"
+                "assert sys.argv[1] == 'naga$@TANUKI.LOCAL', sys.argv\n"
+                f"pathlib.Path({cc_renew!r}).write_bytes(pathlib.Path({cc_ok!r}).read_bytes())\n"
+            )
+        r_ad = run_cmd([
+            CHRONOA, "--ccache", cc_renew, "--now", str(now),
+            "--warn-window-sec", "300", "--renew-cmd", f"python3 {ad_arg_py} naga$@TANUKI.LOCAL",
+            "--once", "--json",
+        ])
+        assert r_ad.returncode == 0, f"AD $ principal renew failed: {r_ad.stdout} {r_ad.stderr}"
+        assert json.loads(r_ad.stdout)["status"] == "RENEWED"
+
+        pwn = os.path.join(td, "pwned")
+        for bad_cmd in (
+            f"python3 {renewer_py}; touch {pwn}",
+            f"python3 {renewer_py} && touch {pwn}",
+            f"$(touch {pwn})",
+            "kinit -R | id",
+        ):
+            r_inj = run_cmd([
+                CHRONOA, "--ccache", cc_renew, "--now", str(now),
+                "--warn-window-sec", "300", "--renew-cmd", bad_cmd, "--once", "--json",
+            ])
+            assert r_inj.returncode == 1, f"Expected USAGE (1) for {bad_cmd!r}, got {r_inj.returncode}"
+            assert not os.path.exists(pwn), f"Shell injection executed for {bad_cmd!r}"
+
+        r_nobin = run_cmd([
+            CHRONOA, "--ccache", cc_exp if False else cc_ok, "--now", str(now),
+            "--warn-window-sec", "7200", "--renew-cmd", "/nonexistent/bin/renew_noop",
+            "--once", "--json",
+        ])
+        assert r_nobin.returncode == 2, f"Expected POLICY_STOP (2) for missing renew binary, got {r_nobin.returncode}"
+        d_nobin = json.loads(r_nobin.stdout)
+        assert d_nobin["status"] == "RENEW_FAILED"
+        assert d_nobin["renew_attempted"] is True and d_nobin["renew_exit_code"] != 0
+
+        # Empty FILE: prefix must not open literal "./FILE:" and must return USAGE (1) or MISSING (3)
+        literal_file_scheme = os.path.join(td, "FILE:")
+        with open(literal_file_scheme, "wb") as f:
+            f.write(b"dummy")
+        r_empty_file = run_cmd([CHRONOA, "--ccache", "FILE:", "--json"], cwd=td)
+        assert r_empty_file.returncode == 1, f"Expected USAGE (1) for --ccache FILE:, got {r_empty_file.returncode}"
+
+        r_env_empty_file = run_cmd([CHRONOA, "--json"], env={"KRB5CCNAME": "FILE:"}, cwd=td)
+        assert r_env_empty_file.returncode == 3, f"Expected MISSING (3) for KRB5CCNAME=FILE:, got {r_env_empty_file.returncode}"
+        assert json.loads(r_env_empty_file.stdout)["error"] != ""
+
+        r_kcm_scheme = run_cmd([CHRONOA, "--ccache", "KCM:1000", "--json"], cwd=td)
+        assert r_kcm_scheme.returncode == 3, f"Expected MISSING (3) for KCM: scheme, got {r_kcm_scheme.returncode}"
+        assert "Unsupported non-FILE" in json.loads(r_kcm_scheme.stdout)["error"]
+
+        # Watch interval >= 2^32 must clamp cleanly and never wrap sleep() to 0
+        watch_proc = subprocess.Popen(
+            [CHRONOA, "--ccache", cc_ok, "--now", str(now), "--watch", "--interval-sec", "4294967296", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.4)
+        watch_proc.send_signal(signal.SIGINT)
+        w_out, w_err = watch_proc.communicate(timeout=3)
+        w_lines = [ln for ln in w_out.splitlines() if ln.strip()]
+        assert len(w_lines) == 1, f"Expected 1 watch line (no sleep(0) spin), got {len(w_lines)}: {w_err}"
+        assert json.loads(w_lines[0])["status"] == "HEALTHY"
 
         # Expired ticket -> exit 2
         cc_exp = os.path.join(td, "cc_expired")
@@ -371,6 +517,147 @@ def test_ranga_isolation_and_purge():
         # Missing target -> exit 3
         r_miss = run_cmd([RANGA, "--purge", os.path.join(td, "nope"), "--json"])
         assert r_miss.returncode == 3
+
+        # --revoke-session positive check MUST run inside ranga --isolate so host keyring is untouched
+        secret_iso = os.path.join(td, "secret_iso.bin")
+        with open(secret_iso, "wb") as f:
+            f.write(b"ISOLATED_SESSION_PURGE_MATERIAL" * 10)
+        r_iso_rev = run_cmd([
+            RANGA, "--isolate", "--", RANGA, "--purge", secret_iso, "--revoke-session", "--json"
+        ])
+        assert r_iso_rev.returncode == 0, f"Isolated --revoke-session failed: {r_iso_rev.stdout} {r_iso_rev.stderr}"
+        d_iso_rev = json.loads(r_iso_rev.stdout)
+        assert d_iso_rev["removed"] is True and d_iso_rev["session_revoked"] is True
+        assert not os.path.exists(secret_iso)
+
+        # Fail-closed CSPRNG: getrandom() + /dev/urandom failure must fail closed with exit 2 and not unlink
+        csprng_so = compile_interposer(
+            td,
+            "fail_csprng",
+            """
+            #define _GNU_SOURCE
+            #include <dlfcn.h>
+            #include <errno.h>
+            #include <fcntl.h>
+            #include <stdarg.h>
+            #include <string.h>
+            #include <sys/types.h>
+            ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+                (void)buf; (void)buflen; (void)flags;
+                errno = ENOSYS;
+                return -1;
+            }
+            int open(const char *pathname, int flags, ...) {
+                static int (*real_open)(const char *, int, ...) = NULL;
+                if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
+                if (pathname && strcmp(pathname, "/dev/urandom") == 0) {
+                    errno = EACCES;
+                    return -1;
+                }
+                if (flags & O_CREAT) {
+                    va_list ap;
+                    va_start(ap, flags);
+                    mode_t mode = (mode_t)va_arg(ap, int);
+                    va_end(ap);
+                    return real_open(pathname, flags, mode);
+                }
+                return real_open(pathname, flags);
+            }
+            """,
+        )
+        if csprng_so:
+            secret_csprng = os.path.join(td, "secret_csprng.bin")
+            with open(secret_csprng, "wb") as f:
+                f.write(b"CSPRNG_FAIL_CLOSED" * 32)
+            r_csprng = run_cmd(
+                [RANGA, "--purge", secret_csprng, "--json"],
+                env={"LD_PRELOAD": csprng_so},
+            )
+            assert r_csprng.returncode == 2, f"Expected exit 2 on CSPRNG failure, got {r_csprng.returncode}"
+            d_csprng = json.loads(r_csprng.stdout)
+            assert d_csprng["removed"] is False and d_csprng["passes"] < 3
+            assert os.path.exists(secret_csprng)
+
+        # lstat + fstat st_ino mismatch must fail closed (exit 2) without overwriting/unlinking
+        fstat_so = compile_interposer(
+            td,
+            "mismatch_fstat",
+            """
+            #define _GNU_SOURCE
+            #include <dlfcn.h>
+            #include <stddef.h>
+            #include <sys/stat.h>
+            int fstat(int fd, struct stat *statbuf) {
+                static int (*real_fstat)(int, struct stat *) = NULL;
+                if (!real_fstat) real_fstat = dlsym(RTLD_NEXT, "fstat");
+                int rc = real_fstat(fd, statbuf);
+                if (rc == 0 && fd > 2 && S_ISREG(statbuf->st_mode)) {
+                    statbuf->st_ino ^= 0x1234ULL;
+                }
+                return rc;
+            }
+            """,
+        )
+        if fstat_so:
+            secret_ino = os.path.join(td, "secret_ino.bin")
+            orig_bytes = b"DO_NOT_WIPE_INODE_MISMATCH" * 8
+            with open(secret_ino, "wb") as f:
+                f.write(orig_bytes)
+            r_ino = run_cmd(
+                [RANGA, "--purge", secret_ino, "--json"],
+                env={"LD_PRELOAD": fstat_so},
+            )
+            assert r_ino.returncode == 2, f"Expected exit 2 on fstat mismatch, got {r_ino.returncode}"
+            d_ino = json.loads(r_ino.stdout)
+            assert d_ino["removed"] is False and d_ino["passes"] == 0
+            assert "identity" in d_ino["error"].lower(), d_ino
+            with open(secret_ino, "rb") as f:
+                assert f.read() == orig_bytes
+
+        # KEYCTL_REVOKE failure must keep session_revoked=false and exit 2 even if KEYCTL_CLEAR succeeds
+        revoke_so = compile_interposer(
+            td,
+            "fail_revoke",
+            """
+            #define _GNU_SOURCE
+            #include <dlfcn.h>
+            #include <errno.h>
+            #include <linux/keyctl.h>
+            #include <stdarg.h>
+            #include <stddef.h>
+            #include <sys/syscall.h>
+            long syscall(long number, ...) {
+                static long (*real_syscall)(long, ...) = NULL;
+                if (!real_syscall) real_syscall = dlsym(RTLD_NEXT, "syscall");
+                va_list ap;
+                va_start(ap, number);
+                unsigned long a1 = va_arg(ap, unsigned long);
+                unsigned long a2 = va_arg(ap, unsigned long);
+                unsigned long a3 = va_arg(ap, unsigned long);
+                unsigned long a4 = va_arg(ap, unsigned long);
+                unsigned long a5 = va_arg(ap, unsigned long);
+                unsigned long a6 = va_arg(ap, unsigned long);
+                va_end(ap);
+                if (number == SYS_keyctl && (int)a1 == KEYCTL_REVOKE) {
+                    errno = EPERM;
+                    return -1;
+                }
+                return real_syscall(number, a1, a2, a3, a4, a5, a6);
+            }
+            """,
+        )
+        if revoke_so:
+            secret_revfail = os.path.join(td, "secret_revfail.bin")
+            with open(secret_revfail, "wb") as f:
+                f.write(b"REVOKE_FAIL_MATERIAL" * 8)
+            r_revfail = run_cmd([
+                RANGA, "--isolate", "--", "env", f"LD_PRELOAD={revoke_so}",
+                RANGA, "--purge", secret_revfail, "--revoke-session", "--json",
+            ])
+            assert r_revfail.returncode == 2, f"Expected exit 2 on KEYCTL_REVOKE failure, got {r_revfail.returncode}"
+            d_revfail = json.loads(r_revfail.stdout)
+            assert d_revfail["session_revoked"] is False
+            assert "KEYCTL_REVOKE" in d_revfail["error"], d_revfail
 
     print("[PASS] ranga LD_PRELOAD libranga.so isolation (0x3f000000), --isolate, 3-pass NIST purge")
 
